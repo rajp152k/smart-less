@@ -3,4 +3,22 @@ name = "smart-less"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "sl"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1.0.104"
+clap = { version = "4.6.6", features = ["derive"] }
+csv = "1.4.0"
+minus = { version = "5.7.2", default-features = false, features = [
+  "static_output",
+  "search",
+] }
+serde_json = "1.0.151"
+serde_yaml_ng = "0.10.0"
+toml = "1.1.4"
+unicode-width = "0.2.2"
+
+[dev-dependencies]
+insta = { version = "1.48.0", features = ["yaml"] }

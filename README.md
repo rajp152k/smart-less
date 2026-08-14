@@ -26,6 +26,7 @@ cargo build --release
 | YAML | `.yaml`, `.yml` | validated, structured terminal text |
 | TOML | `.toml` | validated, structured terminal text |
 | CSV / TSV | `.csv`, `.tsv` | bounded terminal table (first 100 rows / 12 columns) |
+| Source / config code | Rust, Python, JavaScript/TypeScript, shell, Go, and common code/config extensions | safe, bounded syntax highlighting with optional line numbers |
 | Text | fallback and conventional text names | safe text with optional line numbers |
 | Binary | NUL or invalid UTF-8 | bounded hex/ASCII preview |
 
@@ -40,7 +41,7 @@ Each input is capped at 8 MiB by default; override deliberately with `--max-byte
 ```text
 sl [OPTIONS] [FILE]...
 
--t, --type <KIND>       Force text, markdown, json, yaml, toml, csv, tsv, or binary
+-t, --type <KIND>       Force text, markdown, json, yaml, toml, csv, tsv, code, or binary
     --plain             Disable styles and paging
     --color <MODE>      auto, always, or never
     --width <COLUMNS>   Deterministic render width
@@ -51,11 +52,13 @@ sl [OPTIONS] [FILE]...
 -q, --quiet             Suppress non-fatal warnings
 ```
 
-Type selection order is: `--type`, well-known basename, extension, bounded content sniffing, then text/binary fallback.
+Type selection order is: `--type`, well-known basename, extension, bounded content sniffing, then text/binary fallback. Recognized source extensions select code highlighting; JSON, YAML, TOML, CSV/TSV, and Markdown keep their dedicated renderers.
+
+When paging is active, embedded navigation and search are provided by [`minus`](https://crates.io/crates/minus). Structural tree navigation and folding are deliberately deferred rather than approximated with a full TUI.
 
 ## V1 boundaries
 
-V1 intentionally does not provide a full-screen document editor, structured-data folding, image protocols, browser-backed Mermaid rendering, plugins, network access, archive/PDF/image parsing, or source-code execution. Those belong to future capability-gated work.
+V1 intentionally does not provide a full-screen document editor, structural tree navigation or structured-data folding, image protocols, browser-backed Mermaid rendering, plugins, network access, archive/PDF/image parsing, or source-code execution. Those belong to future capability-gated work.
 
 ## Development
 

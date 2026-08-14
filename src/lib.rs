@@ -74,6 +74,7 @@ pub enum DocumentKind {
     Toml,
     Csv,
     Tsv,
+    Code,
     Binary,
 }
 
@@ -85,7 +86,7 @@ impl DocumentKind {
             .and_then(|value| value.to_str())
             .unwrap_or_default();
         if matches!(file, "makefile" | "dockerfile" | ".gitignore") {
-            return Self::Text;
+            return Self::Code;
         }
         let extension = file.rsplit_once('.').map(|(_, extension)| extension);
         match extension {
@@ -95,6 +96,12 @@ impl DocumentKind {
             Some("toml") => Self::Toml,
             Some("csv") => Self::Csv,
             Some("tsv") => Self::Tsv,
+            Some(
+                "rs" | "py" | "pyw" | "pyi" | "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts"
+                | "tsx" | "sh" | "bash" | "zsh" | "fish" | "ksh" | "go" | "c" | "h" | "cc" | "cpp"
+                | "cxx" | "hpp" | "java" | "rb" | "php" | "swift" | "kt" | "sql" | "html" | "css"
+                | "xml" | "ini" | "cfg" | "conf" | "properties" | "env",
+            ) => Self::Code,
             _ if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() => Self::Binary,
             _ if looks_like_json(bytes) => Self::Json,
             _ if looks_like_markdown(bytes) => Self::Markdown,
@@ -110,9 +117,36 @@ struct RenderOptions {
     line_numbers: bool,
 }
 
+#[derive(Clone, Copy)]
+enum SourceLanguage {
+    Rust,
+    Python,
+    JavaScript,
+    Shell,
+    Go,
+    Generic,
+}
+
+impl SourceLanguage {
+    fn from_name(name: &str) -> Option<Self> {
+        let extension = Path::new(name)
+            .extension()
+            .and_then(|value| value.to_str())?
+            .to_ascii_lowercase();
+        Some(match extension.as_str() {
+            "rs" => Self::Rust,
+            "py" | "pyw" | "pyi" => Self::Python,
+            "js" | "mjs" | "cjs" | "jsx" | "ts" | "mts" | "cts" | "tsx" => Self::JavaScript,
+            "sh" | "bash" | "zsh" | "fish" | "ksh" => Self::Shell,
+            "go" => Self::Go,
+            _ => Self::Generic,
+        })
+    }
+}
+
 pub fn run(cli: Cli) -> i32 {
     if cli.list_types {
-        println!("text\nmarkdown\njson\nyaml\ntoml\ncsv\ntsv\nbinary");
+        println!("text\nmarkdown\njson\nyaml\ntoml\ncsv\ntsv\ncode\nbinary");
         return 0;
     }
     if cli.max_bytes == 0 {
@@ -210,7 +244,7 @@ fn read_and_render(
     let kind = forced_kind
         .unwrap_or_else(|| DocumentKind::detect((source != "-").then_some(source), &bytes));
     let mut warning = truncated.then(|| format!("input was truncated at {max_bytes} bytes"));
-    let rendered = match render(kind, &bytes, options) {
+    let rendered = match render(kind, &bytes, options, (source != "-").then_some(source)) {
         Ok(rendered) => rendered,
         Err(error) => {
             warning = Some(format!("{}; rendered safely as text", error));
@@ -238,7 +272,12 @@ fn read_source(source: &str, max_bytes: usize) -> Result<(Vec<u8>, bool)> {
     Ok((bytes, truncated))
 }
 
-fn render(kind: DocumentKind, bytes: &[u8], options: RenderOptions) -> Result<String> {
+fn render(
+    kind: DocumentKind,
+    bytes: &[u8],
+    options: RenderOptions,
+    source: Option<&str>,
+) -> Result<String> {
     match kind {
         DocumentKind::Text => Ok(render_text(&String::from_utf8_lossy(bytes), options)),
         DocumentKind::Markdown => Ok(render_markdown(&String::from_utf8_lossy(bytes), options)),
@@ -247,6 +286,11 @@ fn render(kind: DocumentKind, bytes: &[u8], options: RenderOptions) -> Result<St
         DocumentKind::Toml => render_toml(bytes, options),
         DocumentKind::Csv => render_delimited(bytes, b',', options),
         DocumentKind::Tsv => render_delimited(bytes, b'\t', options),
+        DocumentKind::Code => Ok(render_code(
+            &String::from_utf8_lossy(bytes),
+            source.and_then(SourceLanguage::from_name),
+            options,
+        )),
         DocumentKind::Binary => Ok(render_binary(bytes, options)),
     }
 }
@@ -283,6 +327,183 @@ fn render_structured(text: &str, options: RenderOptions) -> String {
             format!("{}\n", styled)
         })
         .collect()
+}
+
+fn render_code(text: &str, language: Option<SourceLanguage>, options: RenderOptions) -> String {
+    let language = language.unwrap_or(SourceLanguage::Generic);
+    let line_count = text.lines().count().max(1);
+    let digits = line_count.to_string().len();
+    text.lines()
+        .enumerate()
+        .map(|(index, line)| {
+            let line = truncate_display(&sanitize(line), options.width);
+            let line = highlight_code_line(&line, language, options.color);
+            if options.line_numbers {
+                format!(
+                    "{} {}\n",
+                    style(&format!("{:>digits$}", index + 1), "2;90", options.color),
+                    line
+                )
+            } else {
+                format!("{line}\n")
+            }
+        })
+        .collect()
+}
+
+fn highlight_code_line(line: &str, language: SourceLanguage, color: bool) -> String {
+    let mut output = String::with_capacity(line.len());
+    let mut position = 0;
+    while position < line.len() {
+        let remaining = &line[position..];
+        if is_comment_start(remaining, language) {
+            output.push_str(&style(remaining, "2;90", color));
+            break;
+        }
+        let Some(character) = remaining.chars().next() else {
+            break;
+        };
+        if matches!(character, '\'' | '"' | '`') {
+            let end = string_end(remaining, character);
+            output.push_str(&style(&remaining[..end], "32", color));
+            position += end;
+        } else if character.is_ascii_digit() {
+            let end = remaining
+                .char_indices()
+                .take_while(|(_, value)| {
+                    value.is_ascii_alphanumeric() || matches!(value, '.' | '_')
+                })
+                .last()
+                .map_or(character.len_utf8(), |(index, value)| {
+                    index + value.len_utf8()
+                });
+            output.push_str(&style(&remaining[..end], "36", color));
+            position += end;
+        } else if character.is_ascii_alphabetic() || character == '_' {
+            let end = remaining
+                .char_indices()
+                .take_while(|(_, value)| value.is_ascii_alphanumeric() || *value == '_')
+                .last()
+                .map_or(character.len_utf8(), |(index, value)| {
+                    index + value.len_utf8()
+                });
+            let word = &remaining[..end];
+            output.push_str(&style(word, "35", color && is_keyword(word, language)));
+            position += end;
+        } else {
+            output.push(character);
+            position += character.len_utf8();
+        }
+    }
+    output
+}
+
+fn is_comment_start(remaining: &str, language: SourceLanguage) -> bool {
+    remaining.starts_with("//")
+        || remaining.starts_with("/*")
+        || matches!(language, SourceLanguage::Python | SourceLanguage::Shell)
+            && remaining.starts_with('#')
+        || matches!(language, SourceLanguage::Generic) && remaining.starts_with(['#', ';'])
+}
+
+fn string_end(input: &str, quote: char) -> usize {
+    let mut escaped = false;
+    for (index, character) in input.char_indices().skip(1) {
+        if character == quote && !escaped {
+            return index + character.len_utf8();
+        }
+        escaped = character == '\\' && !escaped;
+        if character != '\\' {
+            escaped = false;
+        }
+    }
+    input.len()
+}
+
+fn is_keyword(word: &str, language: SourceLanguage) -> bool {
+    let common = matches!(
+        word,
+        "if" | "else" | "for" | "while" | "return" | "true" | "false" | "null"
+    );
+    common
+        || match language {
+            SourceLanguage::Rust => matches!(
+                word,
+                "as" | "async"
+                    | "await"
+                    | "const"
+                    | "enum"
+                    | "fn"
+                    | "impl"
+                    | "let"
+                    | "match"
+                    | "mod"
+                    | "move"
+                    | "mut"
+                    | "pub"
+                    | "struct"
+                    | "trait"
+                    | "use"
+                    | "where"
+            ),
+            SourceLanguage::Python => matches!(
+                word,
+                "and"
+                    | "as"
+                    | "class"
+                    | "def"
+                    | "elif"
+                    | "from"
+                    | "import"
+                    | "in"
+                    | "is"
+                    | "lambda"
+                    | "None"
+                    | "not"
+                    | "or"
+                    | "pass"
+                    | "True"
+                    | "False"
+                    | "with"
+                    | "yield"
+            ),
+            SourceLanguage::JavaScript => matches!(
+                word,
+                "async"
+                    | "await"
+                    | "class"
+                    | "const"
+                    | "export"
+                    | "function"
+                    | "import"
+                    | "interface"
+                    | "let"
+                    | "new"
+                    | "undefined"
+                    | "var"
+            ),
+            SourceLanguage::Shell => matches!(
+                word,
+                "case" | "do" | "done" | "echo" | "esac" | "fi" | "function" | "in" | "then"
+            ),
+            SourceLanguage::Go => matches!(
+                word,
+                "chan"
+                    | "defer"
+                    | "func"
+                    | "go"
+                    | "map"
+                    | "package"
+                    | "range"
+                    | "select"
+                    | "type"
+                    | "var"
+            ),
+            SourceLanguage::Generic => matches!(
+                word,
+                "class" | "define" | "function" | "include" | "package" | "section"
+            ),
+        }
 }
 
 fn render_text(text: &str, options: RenderOptions) -> String {
@@ -809,8 +1030,77 @@ mod tests {
     }
 
     #[test]
+    fn source_extensions_select_code_without_overriding_structured_formats() {
+        for name in [
+            "main.rs",
+            "tool.py",
+            "app.ts",
+            "script.sh",
+            "server.go",
+            "settings.ini",
+        ] {
+            assert_eq!(
+                DocumentKind::detect(Some(name), b"not structured"),
+                DocumentKind::Code
+            );
+        }
+        assert_eq!(
+            DocumentKind::detect(Some("data.json"), b"let x = 1"),
+            DocumentKind::Json
+        );
+        assert_eq!(
+            DocumentKind::detect(Some("config.yaml"), b"let x = 1"),
+            DocumentKind::Yaml
+        );
+        assert_eq!(
+            DocumentKind::detect(Some("Cargo.toml"), b"let x = 1"),
+            DocumentKind::Toml
+        );
+        assert_eq!(
+            DocumentKind::detect(Some("data.csv"), b"let,x"),
+            DocumentKind::Csv
+        );
+        assert_eq!(
+            DocumentKind::detect(Some("notes.md"), b"let x = 1"),
+            DocumentKind::Markdown
+        );
+    }
+
+    #[test]
     fn terminal_controls_are_visible() {
         assert_eq!(sanitize("hello\x1b[2J"), "hello␛[2J");
+    }
+
+    #[test]
+    fn code_highlighting_sanitizes_input_ansi_sequences() {
+        let rendered = render_code(
+            "let value = \"\x1b[2J\"; // \x1b[31m",
+            Some(SourceLanguage::Rust),
+            RenderOptions {
+                color: true,
+                width: 80,
+                line_numbers: false,
+            },
+        );
+        assert!(rendered.contains("␛[2J"));
+        assert!(rendered.contains("␛[31m"));
+        assert!(!rendered.contains("\x1b[2J"));
+        assert!(!rendered.contains("\x1b[31m"));
+    }
+
+    #[test]
+    fn plain_code_rendering_has_no_ansi_sequences() {
+        let rendered = render_code(
+            "fn main() { println!(\"hello\"); }",
+            Some(SourceLanguage::Rust),
+            RenderOptions {
+                color: false,
+                width: 80,
+                line_numbers: false,
+            },
+        );
+        assert_eq!(rendered, "fn main() { println!(\"hello\"); }\n");
+        assert!(!rendered.contains(ESC));
     }
 
     #[test]

@@ -97,6 +97,7 @@ impl DocumentKind {
             Some("tsv") => Self::Tsv,
             _ if bytes.contains(&0) || std::str::from_utf8(bytes).is_err() => Self::Binary,
             _ if looks_like_json(bytes) => Self::Json,
+            _ if looks_like_markdown(bytes) => Self::Markdown,
             _ => Self::Text,
         }
     }
@@ -305,44 +306,327 @@ fn render_text(text: &str, options: RenderOptions) -> String {
 }
 
 fn render_markdown(text: &str, options: RenderOptions) -> String {
-    let mut fenced = false;
-    text.lines()
-        .map(|line| {
-            let safe = sanitize(line);
-            let trimmed = safe.trim_start();
-            let (content, style_code) = if trimmed.starts_with("```") || trimmed.starts_with("~~~")
+    let lines = text.lines().map(sanitize).collect::<Vec<_>>();
+    let mut output = String::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = &lines[index];
+        let trimmed = line.trim_start();
+        if is_fence(trimmed) {
+            // Code (including Mermaid) is deliberately displayed as source, not interpreted.
+            output.push_str(&style(line, "2;35", options.color));
+            output.push('\n');
+            index += 1;
+            while index < lines.len() {
+                output.push_str(&style(&lines[index], "2", options.color));
+                output.push('\n');
+                if is_fence(lines[index].trim_start()) {
+                    index += 1;
+                    break;
+                }
+                index += 1;
+            }
+        } else if index + 1 < lines.len()
+            && line.contains('|')
+            && is_table_divider(&lines[index + 1])
+        {
+            let mut rows = vec![split_table_row(line)];
+            let alignments = table_alignments(&lines[index + 1]);
+            index += 2; // The divider is formatting, not document content.
+            while index < lines.len()
+                && lines[index].contains('|')
+                && !lines[index].trim().is_empty()
             {
-                fenced = !fenced;
-                (safe, "2;35")
-            } else if fenced {
-                (safe, "2")
-            } else if let Some(title) = trimmed.strip_prefix("# ") {
-                (title.to_owned(), "1;36")
-            } else if trimmed.starts_with("##") {
-                (
-                    trimmed.trim_start_matches('#').trim_start().to_owned(),
-                    "1;34",
-                )
-            } else if trimmed.starts_with("> ") {
-                (safe, "2;33")
-            } else if trimmed.starts_with("- ")
-                || trimmed.starts_with("* ")
-                || trimmed.starts_with("+ ")
-            {
-                (safe, "32")
-            } else {
-                (safe, "")
-            };
-            format!(
-                "{}\n",
-                style(
-                    &truncate_display(&content, options.width),
-                    style_code,
-                    options.color
-                )
+                rows.push(split_table_row(&lines[index]));
+                index += 1;
+            }
+            output.push_str(&render_markdown_table(&rows, &alignments, options));
+        } else if line.trim().is_empty() {
+            output.push('\n');
+            index += 1;
+        } else if let Some((level, title)) = heading(trimmed) {
+            for wrapped in wrap_display(&inline_markdown(title), options.width) {
+                output.push_str(&style(
+                    &wrapped,
+                    if level == 1 { "1;36" } else { "1;34" },
+                    options.color,
+                ));
+                output.push('\n');
+            }
+            index += 1;
+        } else if let Some((prefix, body, quote)) = markdown_prefix(trimmed) {
+            let mut paragraph = vec![body.to_owned()];
+            index += 1;
+            while index < lines.len() {
+                let candidate = lines[index].trim_start();
+                if candidate.is_empty()
+                    || is_fence(candidate)
+                    || heading(candidate).is_some()
+                    || markdown_prefix(candidate).is_some()
+                    || (candidate.contains('|')
+                        && index + 1 < lines.len()
+                        && is_table_divider(&lines[index + 1]))
+                {
+                    break;
+                }
+                paragraph.push(candidate.to_owned());
+                index += 1;
+            }
+            let continuation = " ".repeat(display_width(prefix));
+            for (line_number, wrapped) in wrap_display(
+                &inline_markdown(&paragraph.join(" ")),
+                options.width.saturating_sub(display_width(prefix)),
             )
+            .iter()
+            .enumerate()
+            {
+                let marker = if line_number == 0 || quote {
+                    prefix
+                } else {
+                    &continuation
+                };
+                output.push_str(&style(
+                    &format!("{marker}{wrapped}"),
+                    if quote { "2;33" } else { "32" },
+                    options.color,
+                ));
+                output.push('\n');
+            }
+        } else {
+            let mut paragraph = vec![trimmed.to_owned()];
+            index += 1;
+            while index < lines.len() {
+                let candidate = lines[index].trim_start();
+                if candidate.is_empty()
+                    || is_fence(candidate)
+                    || heading(candidate).is_some()
+                    || markdown_prefix(candidate).is_some()
+                    || (candidate.contains('|')
+                        && index + 1 < lines.len()
+                        && is_table_divider(&lines[index + 1]))
+                {
+                    break;
+                }
+                paragraph.push(candidate.to_owned());
+                index += 1;
+            }
+            for wrapped in wrap_display(&inline_markdown(&paragraph.join(" ")), options.width) {
+                output.push_str(&wrapped);
+                output.push('\n');
+            }
+        }
+    }
+    output
+}
+
+fn is_fence(line: &str) -> bool {
+    line.starts_with("```") || line.starts_with("~~~")
+}
+
+fn heading(line: &str) -> Option<(usize, &str)> {
+    let count = line
+        .chars()
+        .take_while(|character| *character == '#')
+        .count();
+    (count > 0 && count <= 6 && line.as_bytes().get(count) == Some(&b' '))
+        .then(|| (count, line[count..].trim()))
+}
+
+fn markdown_prefix(line: &str) -> Option<(&str, &str, bool)> {
+    if let Some(body) = line.strip_prefix("> ") {
+        return Some(("> ", body, true));
+    }
+    for marker in ["- ", "* ", "+ "] {
+        if let Some(body) = line.strip_prefix(marker) {
+            return Some((marker, body, false));
+        }
+    }
+    let digits = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digits > 0 && line[digits..].starts_with(". ") {
+        return Some((&line[..digits + 2], &line[digits + 2..], false));
+    }
+    None
+}
+
+fn inline_markdown(input: &str) -> String {
+    let mut output = String::new();
+    let mut rest = input;
+    while let Some(open) = rest.find('[') {
+        output.push_str(&rest[..open]);
+        let after_open = &rest[open + 1..];
+        let Some(close) = after_open.find("](") else {
+            output.push('[');
+            rest = after_open;
+            continue;
+        };
+        let label = &after_open[..close];
+        let after_label = &after_open[close + 2..];
+        let Some(end) = after_label.find(')') else {
+            output.push('[');
+            rest = after_open;
+            continue;
+        };
+        output.push_str(label);
+        output.push_str(" <");
+        output.push_str(&after_label[..end]);
+        output.push('>');
+        rest = &after_label[end + 1..];
+    }
+    output.push_str(rest);
+    output
+}
+
+fn display_width(input: &str) -> usize {
+    unicode_width::UnicodeWidthStr::width(input)
+}
+
+fn wrap_display(input: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    let mut used = 0;
+    for word in input.split_whitespace() {
+        let word_width = display_width(word);
+        let separator = usize::from(!current.is_empty());
+        if used + separator + word_width > width && !current.is_empty() {
+            lines.push(current);
+            current = String::new();
+            used = 0;
+        }
+        if !current.is_empty() {
+            current.push(' ');
+            used += 1;
+        }
+        current.push_str(word);
+        used += word_width;
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
+}
+
+fn split_table_row(row: &str) -> Vec<String> {
+    let row = row.trim();
+    let row = row.strip_prefix('|').unwrap_or(row);
+    let row = row.strip_suffix('|').unwrap_or(row);
+    let mut cells = Vec::new();
+    let mut cell = String::new();
+    let mut escaped = false;
+    for character in row.chars() {
+        if escaped {
+            cell.push(character);
+            escaped = false;
+        } else if character == '\\' {
+            escaped = true;
+        } else if character == '|' {
+            cells.push(inline_markdown(cell.trim()));
+            cell.clear();
+        } else {
+            cell.push(character);
+        }
+    }
+    if escaped {
+        cell.push('\\');
+    }
+    cells.push(inline_markdown(cell.trim()));
+    cells
+}
+
+fn is_table_divider(row: &str) -> bool {
+    let cells = split_table_row(row);
+    !cells.is_empty()
+        && cells.iter().all(|cell| {
+            let core = cell.trim().trim_matches(':');
+            core.len() >= 3 && core.bytes().all(|byte| byte == b'-')
         })
+}
+
+#[derive(Clone, Copy)]
+enum TableAlignment {
+    Left,
+    Center,
+    Right,
+}
+
+fn table_alignments(row: &str) -> Vec<TableAlignment> {
+    split_table_row(row)
+        .iter()
+        .map(
+            |cell| match (cell.trim().starts_with(':'), cell.trim().ends_with(':')) {
+                (true, true) => TableAlignment::Center,
+                (_, true) => TableAlignment::Right,
+                _ => TableAlignment::Left,
+            },
+        )
         .collect()
+}
+
+fn render_markdown_table(
+    rows: &[Vec<String>],
+    alignments: &[TableAlignment],
+    options: RenderOptions,
+) -> String {
+    let columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+    if columns == 0 {
+        return String::new();
+    }
+    let available = options.width.saturating_sub(columns * 3 + 1).max(columns);
+    let desired = (0..columns)
+        .map(|column| {
+            rows.iter()
+                .filter_map(|row| row.get(column))
+                .map(|cell| display_width(cell))
+                .max()
+                .unwrap_or(1)
+        })
+        .collect::<Vec<_>>();
+    let mut widths = vec![1; columns];
+    let mut remaining = available.saturating_sub(columns);
+    while remaining > 0 {
+        let mut changed = false;
+        for column in 0..columns {
+            if remaining > 0 && widths[column] < desired[column] {
+                widths[column] += 1;
+                remaining -= 1;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut output = String::new();
+    for (row_index, row) in rows.iter().enumerate() {
+        let cells = (0..columns)
+            .map(|column| {
+                wrap_display(
+                    row.get(column).map(String::as_str).unwrap_or(""),
+                    widths[column],
+                )
+            })
+            .collect::<Vec<_>>();
+        let height = cells.iter().map(Vec::len).max().unwrap_or(1);
+        for line in 0..height {
+            let rendered = (0..columns)
+                .map(|column| {
+                    pad_table_cell(
+                        cells[column].get(line).map(String::as_str).unwrap_or(""),
+                        widths[column],
+                        *alignments.get(column).unwrap_or(&TableAlignment::Left),
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(" | ");
+            output.push_str(&style(
+                &format!("| {rendered} |"),
+                if row_index == 0 { "1;36" } else { "" },
+                options.color,
+            ));
+            output.push('\n');
+        }
+    }
+    output
 }
 
 fn render_delimited(bytes: &[u8], delimiter: u8, options: RenderOptions) -> Result<String> {
@@ -384,6 +668,23 @@ fn render_delimited(bytes: &[u8], delimiter: u8, options: RenderOptions) -> Resu
         output.push('\n');
     }
     Ok(output)
+}
+
+fn pad_table_cell(input: &str, width: usize, alignment: TableAlignment) -> String {
+    let padding = width.saturating_sub(display_width(input));
+    match alignment {
+        TableAlignment::Left => format!("{input}{}", " ".repeat(padding)),
+        TableAlignment::Right => format!("{}{input}", " ".repeat(padding)),
+        TableAlignment::Center => {
+            let left = padding / 2;
+            format!(
+                "{}{}{}",
+                " ".repeat(left),
+                input,
+                " ".repeat(padding - left)
+            )
+        }
+    }
 }
 
 fn render_binary(bytes: &[u8], options: RenderOptions) -> String {
@@ -457,6 +758,27 @@ fn style(input: &str, code: &str, enabled: bool) -> String {
     } else {
         input.to_owned()
     }
+}
+
+fn looks_like_markdown(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let lines = text.lines().take(80).collect::<Vec<_>>();
+    let list_or_quote_count = lines
+        .iter()
+        .filter(|line| markdown_prefix(line.trim_start()).is_some())
+        .count();
+    lines.iter().enumerate().any(|(index, line)| {
+        let trimmed = line.trim_start();
+        heading(trimmed).is_some()
+            || is_fence(trimmed)
+            || (line.contains('[') && line.contains("]("))
+            || (line.contains('|')
+                && lines
+                    .get(index + 1)
+                    .is_some_and(|next| is_table_divider(next)))
+    }) || list_or_quote_count >= 2
 }
 
 fn looks_like_json(bytes: &[u8]) -> bool {
@@ -539,11 +861,56 @@ mod tests {
             "# Diagram\n```mermaid\ngraph TD\n  A-->B\n```",
             RenderOptions {
                 color: false,
-                width: 80,
+                width: 20,
                 line_numbers: false,
             },
         );
         assert!(rendered.contains("graph TD"));
-        assert!(rendered.contains("A-->B"));
+        assert!(rendered.contains("  A-->B"));
+    }
+
+    #[test]
+    fn markdown_is_sniffed_from_stdin_content() {
+        assert_eq!(
+            DocumentKind::detect(None, b"# Notes\n\n- first\n- second\n"),
+            DocumentKind::Markdown
+        );
+        assert_eq!(
+            DocumentKind::detect(None, b"ordinary text\n"),
+            DocumentKind::Text
+        );
+    }
+
+    #[test]
+    fn markdown_reflows_prose_lists_quotes_and_links_without_clipping() {
+        let rendered = render_markdown(
+            "A [useful link](https://example.test/docs) has enough words to wrap safely.\n\n- a list item with enough words to wrap safely\n> a quoted sentence with enough words to wrap safely",
+            RenderOptions {
+                color: false,
+                width: 24,
+                line_numbers: false,
+            },
+        );
+        assert!(rendered.contains("useful link"));
+        assert!(rendered.contains("<https://example.test/docs>"));
+        assert!(rendered.contains("- a list item"));
+        assert!(rendered.contains("> a quoted sentence"));
+        assert!(!rendered.contains('…'));
+    }
+
+    #[test]
+    fn markdown_tables_remove_divider_and_wrap_cells() {
+        let rendered = render_markdown(
+            "| Name | Description |\n| :--- | ---: |\n| Ada | A long description that wraps rather than being clipped |",
+            RenderOptions {
+                color: false,
+                width: 30,
+                line_numbers: false,
+            },
+        );
+        assert!(rendered.contains("| Name"));
+        assert!(rendered.contains("than being clipped"));
+        assert!(!rendered.contains("---"));
+        assert!(rendered.lines().all(|line| display_width(line) <= 30));
     }
 }

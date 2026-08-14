@@ -21,7 +21,7 @@ cargo build --release
 
 | Type | Detection | Rendering |
 | --- | --- | --- |
-| Markdown | `.md`, `.markdown`, `.mdown` | headings, lists, quotes, and fenced blocks; Mermaid remains safe source text |
+| Markdown | `.md`, `.markdown`, `.mdown`, or conservative Markdown sniffing | reflowed prose, lists, quotes, readable links, and wrapped GFM pipe tables; fenced blocks/Mermaid remain safe source text |
 | JSON | `.json`, `.jsonc`, `.ndjson`, or valid JSON sniffing | validated and pretty-printed |
 | YAML | `.yaml`, `.yml` | validated, structured terminal text |
 | TOML | `.toml` | validated, structured terminal text |

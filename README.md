@@ -4,16 +4,24 @@ A safe, read-only terminal reader for structured documents. `sl` detects common 
 
 ## Install / run
 
+Install from GitHub:
+
 ```sh
-cargo run -- README.md
-cargo run -- data.json
-cat config.yaml | cargo run -- -
+cargo install --git https://github.com/rajp152k/smart-less --locked
 ```
 
-The built binary is named `sl`:
+After the crate is published, use `cargo install smart-less` instead.
 
 ```sh
-cargo build --release
+sl README.md
+sl data.json
+cat config.yaml | sl -
+```
+
+Or build from a checkout:
+
+```sh
+cargo build --release --locked
 ./target/release/sl --help
 ```
 
@@ -34,7 +42,9 @@ cargo build --release
 
 `sl` only reads its specified input or stdin. It never executes document content, follows links, launches renderers, fetches assets, or writes source files. Input control characters (including terminal escapes) are rendered visibly rather than replayed.
 
-Each input is capped at 8 MiB by default; override deliberately with `--max-bytes`. Truncated or invalid structured inputs emit a warning on stderr and fall back to safe text rendering.
+Each input is capped at 8 MiB by default; override deliberately with `--max-bytes` (which must be greater than zero). Reads are bounded per input, CSV/TSV rendering is limited to 100 rows and 12 columns, and binary previews are limited to 4 KiB. Truncated or invalid structured inputs emit a warning on stderr and fall back to safe text rendering.
+
+Exit status is `0` when every requested input was rendered (including safe fallback after a non-fatal parse warning), `2` when at least one requested input could not be read while another was rendered, and `1` for invalid CLI limits, pager/output failures, or when no input could be rendered. Broken pipes are treated as normal output termination.
 
 ## CLI
 
@@ -44,6 +54,7 @@ sl [OPTIONS] [FILE]...
 -t, --type <KIND>       Force text, markdown, json, yaml, toml, csv, tsv, code, or binary
     --plain             Disable styles and paging
     --color <MODE>      auto, always, or never
+    --theme <THEME>     default, dark, or mono (mono emits no ANSI)
     --width <COLUMNS>   Deterministic render width
     --max-bytes <N>     Per-input read limit
     --no-pager          Write directly instead of paging
@@ -54,11 +65,13 @@ sl [OPTIONS] [FILE]...
 
 Type selection order is: `--type`, well-known basename, extension, bounded content sniffing, then text/binary fallback. Recognized source extensions select code highlighting; JSON, YAML, TOML, CSV/TSV, and Markdown keep their dedicated renderers.
 
-When paging is active, embedded navigation and search are provided by [`minus`](https://crates.io/crates/minus). Structural tree navigation and folding are deliberately deferred rather than approximated with a full TUI.
+When stdout is a TTY, paging is active unless `--plain` or `--no-pager` is supplied. The built-in [`minus`](https://crates.io/crates/minus) pager provides the familiar screen navigation and text search controls shown by its on-screen help (use `q` to quit and `/` to search). `sl` does not implement structural tree navigation, folding, or jump-to-key navigation; those are deliberately deferred rather than claimed as pager features.
+
+`--theme default` uses the standard ANSI palette; `--theme dark` uses brighter foregrounds for dark terminals; and `--theme mono`, `--color never`, or `--plain` emits no ANSI styling. Regardless of theme, input escape/control sequences are shown visibly and are never passed through.
 
 ## V1 boundaries
 
-V1 intentionally does not provide a full-screen document editor, structural tree navigation or structured-data folding, image protocols, browser-backed Mermaid rendering, plugins, network access, archive/PDF/image parsing, or source-code execution. Those belong to future capability-gated work.
+V1 intentionally does not provide a full-screen document editor, structural tree navigation or structured-data folding, image protocols, browser-backed Mermaid rendering, plugins, network access, archive/PDF/image parsing, or source-code execution. Those are deferred rather than silently approximated.
 
 ## Development
 

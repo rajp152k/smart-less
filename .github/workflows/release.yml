@@ -1,0 +1,28 @@
+---
+name: Release
+
+'on':
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+        with:
+          persist-credentials: false
+      - run: cargo test --locked
+      - run: cargo build --release --locked
+      - run: >-
+          tar -czf "smart-less-${GITHUB_REF_NAME}-${RUNNER_OS}.tar.gz"
+          -C target/release sl
+      - run: >-
+          gh release create "$GITHUB_REF_NAME"
+          "smart-less-${GITHUB_REF_NAME}-${RUNNER_OS}.tar.gz" --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}

@@ -2,6 +2,14 @@
 name = "smart-less"
 version = "0.1.0"
 edition = "2024"
+description = "A safe, read-only terminal reader for structured documents"
+license = "MIT"
+repository = "https://github.com/rajp152k/smart-less"
+homepage = "https://github.com/rajp152k/smart-less"
+readme = "README.md"
+keywords = ["terminal", "pager", "markdown", "json", "yaml"]
+categories = ["command-line-utilities", "text-processing"]
+rust-version = "1.85"
 
 [[bin]]
 name = "sl"

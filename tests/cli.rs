@@ -121,12 +121,10 @@ fn stdin_errors_limits_and_controls_have_defined_behavior() {
     let controls = fixture("controls.txt").display().to_string();
     let output = sl(&["--plain", "--no-pager", &controls]);
     assert!(output.status.success());
-    assert!(
-        output
-            .stdout
-            .windows(3)
-            .any(|bytes| bytes == "␛".as_bytes())
-    );
+    assert!(output
+        .stdout
+        .windows(3)
+        .any(|bytes| bytes == "␛".as_bytes()));
     assert!(!output.stdout.contains(&0x1b));
     assert!(!output.stdout.contains(&0x07));
 

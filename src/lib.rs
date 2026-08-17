@@ -14,7 +14,7 @@ use crossterm::{
     execute,
     terminal::{self, ClearType},
 };
-use scraper::{Html, Selector};
+use scraper::{ElementRef, Html, Selector, node::Node};
 use url::Url;
 
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
@@ -319,13 +319,12 @@ fn fetch_web(start: &Url, max_bytes: usize) -> Result<WebPage> {
         } else {
             format!("{host}:{}", url.port_or_known_default().unwrap_or(80))
         };
-        let socket = address
+        let mut stream = address
             .to_socket_addrs()
             .with_context(|| "could not resolve local web server")?
-            .find(|candidate| candidate.ip().is_loopback())
-            .context("localhost did not resolve to a loopback address")?;
-        let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
-            .with_context(|| "could not connect to local web server")?;
+            .filter(|candidate| candidate.ip().is_loopback())
+            .find_map(|socket| TcpStream::connect_timeout(&socket, Duration::from_secs(3)).ok())
+            .context("could not connect to a loopback local web server")?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let path = if url.path().is_empty() {
@@ -342,9 +341,12 @@ fn fetch_web(start: &Url, max_bytes: usize) -> Result<WebPage> {
             stream,
             "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: text/html, text/plain\r\n\r\n"
         )?;
-        let mut response = Vec::new();
-        stream.read_to_end(&mut response)?;
-        if response.len() > max_bytes + 64 * 1024 {
+        let response_limit = max_bytes.saturating_add(64 * 1024).saturating_add(1);
+        let mut response = Vec::with_capacity(response_limit.min(64 * 1024));
+        Read::by_ref(&mut stream)
+            .take(response_limit as u64)
+            .read_to_end(&mut response)?;
+        if response.len() == response_limit {
             bail!("response exceeds --max-bytes")
         }
         let split = response
@@ -395,7 +397,7 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
     let mut text = String::new();
     for block in root.select(&block_selector) {
         let name = block.value().name();
-        let value = sanitize(&block.text().collect::<Vec<_>>().join(" "))
+        let value = sanitize(&visible_html_text(block))
             .split_whitespace()
             .collect::<Vec<_>>()
             .join(" ");
@@ -411,7 +413,7 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
         }
     }
     if text.trim().is_empty() {
-        text = sanitize(&root.text().collect::<Vec<_>>().join(" "));
+        text = sanitize(&visible_html_text(root));
     }
     let link_selector = Selector::parse("a[href]").unwrap();
     let mut links = Vec::new();
@@ -419,7 +421,7 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
     for anchor in root.select(&link_selector) {
         if let Some(href) = anchor.value().attr("href") {
             if let Ok(link) = url.join(href) {
-                let label = sanitize(&anchor.text().collect::<Vec<_>>().join(" "));
+                let label = sanitize(&visible_html_text(anchor));
                 if validate_local_url(&link).is_ok() {
                     links.push(link.clone());
                     visible_links.push(format!("  [{}] {} <{}>", links.len(), label, link));
@@ -442,6 +444,44 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
         text,
         links,
     })
+}
+
+fn visible_html_text(element: ElementRef<'_>) -> String {
+    let mut text = String::new();
+    for child in element.children() {
+        match child.value() {
+            Node::Text(value) => text.push_str(value),
+            Node::Element(_) => {
+                if let Some(child) = ElementRef::wrap(child)
+                    && !is_ignored_html_element(child.value().name())
+                {
+                    text.push_str(&visible_html_text(child));
+                }
+            }
+            _ => {}
+        }
+    }
+    text
+}
+
+fn is_ignored_html_element(name: &str) -> bool {
+    matches!(
+        name,
+        "script"
+            | "style"
+            | "form"
+            | "input"
+            | "select"
+            | "textarea"
+            | "button"
+            | "img"
+            | "picture"
+            | "svg"
+            | "canvas"
+            | "iframe"
+            | "noscript"
+            | "template"
+    )
 }
 
 fn run_web(cli: &Cli, stdout_is_tty: bool) -> i32 {
@@ -1653,7 +1693,7 @@ mod tests {
         }
         let page = render_web(
             &Url::parse("http://localhost:3000/")?,
-            "<main><h1>Title</h1><p>Hello <b>reader</b>.</p><form>bad</form><script>bad()</script><a href='/next'>Next</a><a href='http://example.test/'>Remote</a></main>",
+            "<main><h1>Title</h1><p>Hello <b>reader</b><script>bad()</script>.</p><form>bad</form><a href='/next'>Next</a><a href='http://example.test/'>Remote</a></main>",
         )?;
         assert!(page.text.contains("Title"));
         assert!(page.text.contains("Hello reader"));

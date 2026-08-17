@@ -16,6 +16,8 @@ After the crate is published, use `cargo install smart-less` instead.
 sl README.md
 sl data.json
 cat config.yaml | sl -
+# Read a page served by a local development server
+sl http://localhost:3000/docs
 ```
 
 Or build from a checkout:
@@ -40,7 +42,7 @@ cargo build --release --locked
 
 ## Safety contract
 
-`sl` only reads its specified input or stdin. It never executes document content, follows links, launches renderers, fetches assets, or writes source files. Input control characters (including terminal escapes) are rendered visibly rather than replayed.
+`sl` only reads its specified input or stdin, except for its deliberately narrow local web-reader mode. A single positional `http://localhost/...`, `http://127.x.x.x/...`, or `http://[::1]/...` URL opens that mode; URLs cannot be mixed with files. It uses direct HTTP GET only (no proxies, credentials, cookies, forms, JavaScript, assets, HTTPS, or other methods), validates the initial URL and every redirect/navigation destination, and rejects remote and LAN hosts. It never executes document content, launches renderers, or writes source files. Input control characters (including terminal escapes) are rendered visibly rather than replayed.
 
 Each input is capped at 8 MiB by default; override deliberately with `--max-bytes` (which must be greater than zero). Reads are bounded per input, CSV/TSV rendering is limited to 100 rows and 12 columns, and binary previews are limited to 4 KiB. Truncated or invalid structured inputs emit a warning on stderr and fall back to safe text rendering.
 
@@ -61,11 +63,13 @@ sl [OPTIONS] [FILE]...
     --no-line-numbers   Omit text line numbers
     --list-types        Print supported kinds
 -q, --quiet             Suppress non-fatal warnings
+
+A single `http://localhost/...`, `http://127.x.x.x/...`, or `http://[::1]/...` positional argument activates the local web reader (HTTP only; URLs cannot be mixed with files).
 ```
 
 Type selection order is: `--type`, well-known basename, extension, bounded content sniffing, then text/binary fallback. Recognized source extensions select code highlighting; JSON, YAML, TOML, CSV/TSV, and Markdown keep their dedicated renderers.
 
-When stdout is a TTY, paging is active unless `--plain` or `--no-pager` is supplied. The built-in [`minus`](https://crates.io/crates/minus) pager provides the familiar screen navigation and text search controls shown by its on-screen help (use `q` to quit and `/` to search). `sl` does not implement structural tree navigation, folding, or jump-to-key navigation; those are deliberately deferred rather than claimed as pager features.
+When stdout is a TTY, file paging is active unless `--plain` or `--no-pager` is supplied. The built-in [`minus`](https://crates.io/crates/minus) pager provides the familiar screen navigation and text search controls shown by its on-screen help (use `q` to quit and `/` to search). Local URL mode instead uses its own alternate-screen reader: arrows or `j`/`k` scroll, `/` searches, type a displayed local-link number then Enter to follow it, `b`/`f` navigate history, `r` reloads, `?` shows help, and `q` restores the terminal and exits. With `--no-pager`, `--plain`, or non-TTY stdout, URL mode fetches once and prints sanitized readable content plus visible local links.
 
 `--theme default` uses the standard ANSI palette; `--theme dark` uses brighter foregrounds for dark terminals; and `--theme mono`, `--color never`, or `--plain` emits no ANSI styling. Regardless of theme, input escape/control sequences are shown visibly and are never passed through.
 

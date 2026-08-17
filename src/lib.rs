@@ -1,11 +1,21 @@
 use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
+    net::TcpStream,
     path::Path,
+    time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, ValueEnum};
+use crossterm::{
+    cursor,
+    event::{self, Event, KeyCode},
+    execute,
+    terminal::{self, ClearType},
+};
+use scraper::{Html, Selector};
+use url::Url;
 
 const DEFAULT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const ESC: char = '\u{1b}';
@@ -17,8 +27,8 @@ const ESC: char = '\u{1b}';
     about = "A safe, read-only terminal document reader"
 )]
 pub struct Cli {
-    /// Files to read. Use - for standard input.
-    #[arg(value_name = "FILE", default_value = "-")]
+    /// Files to read, or one literal local http:// URL. Use - for standard input.
+    #[arg(value_name = "FILE|URL", default_value = "-")]
     pub files: Vec<String>,
 
     /// Force the input type instead of detecting it.
@@ -187,6 +197,18 @@ pub fn run(cli: Cli) -> i32 {
     }
 
     let stdout_is_tty = io::stdout().is_terminal();
+    let url_sources = cli
+        .files
+        .iter()
+        .filter(|source| is_url_source(source))
+        .count();
+    if url_sources > 0 {
+        if url_sources != cli.files.len() || url_sources != 1 {
+            eprintln!("sl: URL mode accepts exactly one URL and cannot be mixed with files");
+            return 1;
+        }
+        return run_web(&cli, stdout_is_tty);
+    }
     let color = !cli.plain
         && cli.theme != Theme::Mono
         && match cli.color {
@@ -255,6 +277,343 @@ pub fn run(cli: Cli) -> i32 {
         return 1;
     }
     if failures > 0 { 2 } else { 0 }
+}
+
+fn is_url_source(source: &str) -> bool {
+    source.starts_with("http://") || source.starts_with("https://")
+}
+
+#[derive(Clone)]
+struct WebPage {
+    url: Url,
+    text: String,
+    links: Vec<Url>,
+}
+
+fn validate_local_url(url: &Url) -> Result<()> {
+    if url.scheme() != "http" {
+        bail!("only http:// local URLs are permitted")
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        bail!("URL credentials are not permitted")
+    }
+    let host = url.host_str().unwrap_or_default();
+    let loopback_v4 = host.split('.').next() == Some("127")
+        && host.split('.').count() == 4
+        && host.split('.').all(|part| part.parse::<u8>().is_ok());
+    if host != "localhost" && host != "::1" && host != "[::1]" && !loopback_v4 {
+        bail!("URL host is not localhost or loopback")
+    }
+    Ok(())
+}
+
+fn fetch_web(start: &Url, max_bytes: usize) -> Result<WebPage> {
+    let mut url = start.clone();
+    for _ in 0..10 {
+        validate_local_url(&url)?;
+        let host = url.host_str().context("URL has no host")?;
+        let address = if host == "[::1]" {
+            format!("{host}:{}", url.port_or_known_default().unwrap_or(80))
+        } else if host == "::1" {
+            format!("[::1]:{}", url.port_or_known_default().unwrap_or(80))
+        } else {
+            format!("{host}:{}", url.port_or_known_default().unwrap_or(80))
+        };
+        let mut stream = TcpStream::connect(&address)
+            .with_context(|| "could not connect to local web server")?;
+        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        let path = if url.path().is_empty() {
+            "/"
+        } else {
+            url.path()
+        };
+        let target = match url.query() {
+            Some(q) => format!("{path}?{q}"),
+            None => path.to_owned(),
+        };
+        // Deliberately no proxy, cookies, auth, body, or non-GET request capability.
+        write!(
+            stream,
+            "GET {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\nAccept: text/html, text/plain\r\n\r\n"
+        )?;
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response)?;
+        if response.len() > max_bytes + 64 * 1024 {
+            bail!("response exceeds --max-bytes")
+        }
+        let split = response
+            .windows(4)
+            .position(|w| w == b"\r\n\r\n")
+            .context("invalid HTTP response")?;
+        let headers = String::from_utf8_lossy(&response[..split]);
+        let mut lines = headers.lines();
+        let status = lines
+            .next()
+            .and_then(|s| s.split_whitespace().nth(1))
+            .unwrap_or("")
+            .parse::<u16>()
+            .context("invalid HTTP status")?;
+        if (300..400).contains(&status) {
+            let location = lines
+                .find_map(|line| {
+                    line.split_once(':')
+                        .filter(|(k, _)| k.eq_ignore_ascii_case("location"))
+                        .map(|(_, v)| v.trim())
+                })
+                .context("redirect without Location")?;
+            url = url.join(location).context("invalid redirect URL")?;
+            validate_local_url(&url)?;
+            continue;
+        }
+        if status != 200 {
+            bail!("local server returned HTTP {status}")
+        }
+        let body = &response[split + 4..];
+        if body.len() > max_bytes {
+            bail!("response exceeds --max-bytes")
+        }
+        return render_web(&url, &String::from_utf8_lossy(body));
+    }
+    bail!("too many redirects")
+}
+
+fn render_web(url: &Url, source: &str) -> Result<WebPage> {
+    let document = Html::parse_document(source);
+    let root_selector = Selector::parse("main, article, body").unwrap();
+    let root = document
+        .select(&root_selector)
+        .next()
+        .context("page has no readable body")?;
+    let block_selector =
+        Selector::parse("h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, table").unwrap();
+    let mut text = String::new();
+    for block in root.select(&block_selector) {
+        let name = block.value().name();
+        let value = sanitize(&block.text().collect::<Vec<_>>().join(" "))
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        if value.is_empty() {
+            continue;
+        }
+        match name {
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => text.push_str(&format!("\n{value}\n")),
+            "li" => text.push_str(&format!("- {value}\n")),
+            "blockquote" => text.push_str(&format!("> {value}\n")),
+            "pre" => text.push_str(&format!("\n{value}\n")),
+            _ => text.push_str(&format!("{value}\n\n")),
+        }
+    }
+    if text.trim().is_empty() {
+        text = sanitize(&root.text().collect::<Vec<_>>().join(" "));
+    }
+    let link_selector = Selector::parse("a[href]").unwrap();
+    let mut links = Vec::new();
+    let mut visible_links = Vec::new();
+    for anchor in root.select(&link_selector) {
+        if let Some(href) = anchor.value().attr("href") {
+            if let Ok(link) = url.join(href) {
+                let label = sanitize(&anchor.text().collect::<Vec<_>>().join(" "));
+                if validate_local_url(&link).is_ok() {
+                    links.push(link.clone());
+                    visible_links.push(format!("  [{}] {} <{}>", links.len(), label, link));
+                } else {
+                    // Remote links are visible reading material, never navigation targets.
+                    visible_links.push(format!("  {} <{}> (not navigable)", label, link));
+                }
+            }
+        }
+    }
+    if !visible_links.is_empty() {
+        text.push_str("\nLinks:\n");
+        for link in visible_links {
+            text.push_str(&link);
+            text.push('\n');
+        }
+    }
+    Ok(WebPage {
+        url: url.clone(),
+        text,
+        links,
+    })
+}
+
+fn run_web(cli: &Cli, stdout_is_tty: bool) -> i32 {
+    let start = match Url::parse(&cli.files[0]) {
+        Ok(url) => match validate_local_url(&url) {
+            Ok(()) => url,
+            Err(error) => {
+                eprintln!("sl: {error}");
+                return 1;
+            }
+        },
+        Err(error) => {
+            eprintln!("sl: {error}");
+            return 1;
+        }
+    };
+    if !stdout_is_tty || cli.no_pager || cli.plain {
+        match fetch_web(&start, cli.max_bytes) {
+            Ok(page) => {
+                return write_stdout(&page.text).map_or_else(
+                    |e| {
+                        eprintln!("sl: write error: {e}");
+                        1
+                    },
+                    |_| 0,
+                );
+            }
+            Err(e) => {
+                eprintln!("sl: {e:#}");
+                return 1;
+            }
+        }
+    }
+    match web_ui(start, cli.max_bytes) {
+        Ok(()) => 0,
+        Err(e) => {
+            eprintln!("sl: web reader: {e:#}");
+            1
+        }
+    }
+}
+
+struct TerminalGuard;
+impl TerminalGuard {
+    fn enter() -> Result<Self> {
+        terminal::enable_raw_mode()?;
+        execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide)?;
+        Ok(Self)
+    }
+}
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let _ = execute!(io::stdout(), cursor::Show, terminal::LeaveAlternateScreen);
+        let _ = terminal::disable_raw_mode();
+    }
+}
+
+fn web_ui(start: Url, max_bytes: usize) -> Result<()> {
+    let _guard = TerminalGuard::enter()?;
+    let mut history = vec![fetch_web(&start, max_bytes)?];
+    let mut position = 0usize;
+    let mut offset = 0usize;
+    let mut link_number = String::new();
+    loop {
+        let (_, rows) = terminal::size()?;
+        let page = &history[position];
+        execute!(
+            io::stdout(),
+            cursor::MoveTo(0, 0),
+            terminal::Clear(ClearType::All)
+        )?;
+        println!("sl local web: {}  (q help: ?) {}", page.url, link_number);
+        let lines: Vec<_> = page.text.lines().collect();
+        let height = rows.saturating_sub(2) as usize;
+        for line in lines.iter().skip(offset).take(height) {
+            println!("{}", truncate_display(line, terminal::size()?.0 as usize));
+        }
+        io::stdout().flush()?;
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Char('q') => break,
+                KeyCode::Down | KeyCode::Char('j') => {
+                    offset = (offset + 1).min(lines.len().saturating_sub(1))
+                }
+                KeyCode::Up | KeyCode::Char('k') => offset = offset.saturating_sub(1),
+                KeyCode::PageDown => offset = (offset + height).min(lines.len().saturating_sub(1)),
+                KeyCode::PageUp => offset = offset.saturating_sub(height),
+                KeyCode::Char('b') | KeyCode::Left => {
+                    if position > 0 {
+                        position -= 1;
+                        offset = 0
+                    }
+                }
+                KeyCode::Char('f') | KeyCode::Right => {
+                    if position + 1 < history.len() {
+                        position += 1;
+                        offset = 0
+                    }
+                }
+                KeyCode::Char('r') => {
+                    history[position] = fetch_web(&history[position].url, max_bytes)?;
+                    offset = 0
+                }
+                KeyCode::Char('?') => {
+                    execute!(
+                        io::stdout(),
+                        terminal::Clear(ClearType::All),
+                        cursor::MoveTo(0, 0)
+                    )?;
+                    println!(
+                        "j/k or arrows scroll; / search; type a link number then Enter; b/f back/forward; r reload; q quit\nPress any key."
+                    );
+                    let _ = event::read()?;
+                }
+                KeyCode::Char('/') => {
+                    if let Some(query) = web_prompt("Search: ")? {
+                        if let Some(found) = lines.iter().position(|line| {
+                            line.to_ascii_lowercase()
+                                .contains(&query.to_ascii_lowercase())
+                        }) {
+                            offset = found;
+                        }
+                    }
+                }
+                KeyCode::Char(digit) if digit.is_ascii_digit() => link_number.push(digit),
+                KeyCode::Backspace => {
+                    link_number.pop();
+                }
+                KeyCode::Enter => {
+                    if let Ok(number) = link_number.parse::<usize>() {
+                        if let Some(link) = page.links.get(number.saturating_sub(1)) {
+                            let next = fetch_web(link, max_bytes)?;
+                            history.truncate(position + 1);
+                            history.push(next);
+                            position += 1;
+                            offset = 0;
+                        }
+                    }
+                    link_number.clear();
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
+}
+
+fn web_prompt(label: &str) -> Result<Option<String>> {
+    let (_, rows) = terminal::size()?;
+    execute!(
+        io::stdout(),
+        cursor::MoveTo(0, rows.saturating_sub(1)),
+        terminal::Clear(ClearType::CurrentLine)
+    )?;
+    print!("{label}");
+    io::stdout().flush()?;
+    let mut value = String::new();
+    loop {
+        if let Event::Key(key) = event::read()? {
+            match key.code {
+                KeyCode::Enter => return Ok((!value.is_empty()).then_some(value)),
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Backspace => {
+                    value.pop();
+                }
+                KeyCode::Char(c) => value.push(c),
+                _ => {}
+            }
+            execute!(
+                io::stdout(),
+                cursor::MoveTo(0, rows.saturating_sub(1)),
+                terminal::Clear(ClearType::CurrentLine)
+            )?;
+            print!("{label}{value}");
+            io::stdout().flush()?;
+        }
+    }
 }
 
 fn page(output: &str) -> Result<()> {
@@ -1269,6 +1628,33 @@ mod tests {
         assert!(rendered.contains("- a list item"));
         assert!(rendered.contains("> a quoted sentence"));
         assert!(!rendered.contains('…'));
+    }
+
+    #[test]
+    fn local_web_urls_and_html_are_constrained() -> Result<()> {
+        for value in [
+            "http://localhost:3000/a",
+            "http://127.1.2.3/a",
+            "http://[::1]/a",
+        ] {
+            assert!(validate_local_url(&Url::parse(value)?).is_ok());
+        }
+        for value in [
+            "https://localhost/a",
+            "http://192.168.1.2/a",
+            "http://user@localhost/a",
+        ] {
+            assert!(validate_local_url(&Url::parse(value)?).is_err());
+        }
+        let page = render_web(
+            &Url::parse("http://localhost:3000/")?,
+            "<main><h1>Title</h1><p>Hello <b>reader</b>.</p><form>bad</form><script>bad()</script><a href='/next'>Next</a><a href='http://example.test/'>Remote</a></main>",
+        )?;
+        assert!(page.text.contains("Title"));
+        assert!(page.text.contains("Hello reader"));
+        assert!(!page.text.contains("bad"));
+        assert_eq!(page.links, vec![Url::parse("http://localhost:3000/next")?]);
+        Ok(())
     }
 
     #[test]

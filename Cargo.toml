@@ -27,6 +27,9 @@ serde_json = "1.0.151"
 serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
 unicode-width = "0.2.2"
+crossterm = "0.29.0"
+scraper = "0.24.0"
+url = "2.5.8"
 
 [patch.crates-io]
 # minus 5.7.2 panics after confirming a search with no matches.

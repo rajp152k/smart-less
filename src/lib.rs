@@ -387,25 +387,33 @@ fn fetch_web(start: &Url, max_bytes: usize) -> Result<WebPage> {
 
 fn render_web(url: &Url, source: &str) -> Result<WebPage> {
     let document = Html::parse_document(source);
-    let root_selector = Selector::parse("main, article, body").unwrap();
+    let article_selector = Selector::parse("article").unwrap();
+    let main_selector = Selector::parse("main").unwrap();
+    let body_selector = Selector::parse("body").unwrap();
     let root = document
-        .select(&root_selector)
+        .select(&article_selector)
         .next()
+        .or_else(|| document.select(&main_selector).next())
+        .or_else(|| document.select(&body_selector).next())
         .context("page has no readable body")?;
     let block_selector =
         Selector::parse("h1, h2, h3, h4, h5, h6, p, li, blockquote, pre, table").unwrap();
     let mut text = String::new();
     for block in root.select(&block_selector) {
         let name = block.value().name();
-        let value = sanitize(&visible_html_text(block))
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
+        let value = sanitize(
+            &visible_html_text(block)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
         if value.is_empty() {
             continue;
         }
         match name {
-            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => text.push_str(&format!("\n{value}\n")),
+            "h1" | "h2" | "h3" | "h4" | "h5" | "h6" => {
+                text.push_str(&format!("\n{}\n", value.trim_end_matches('¶').trim_end()))
+            }
             "li" => text.push_str(&format!("- {value}\n")),
             "blockquote" => text.push_str(&format!("> {value}\n")),
             "pre" => text.push_str(&format!("\n{value}\n")),
@@ -413,7 +421,12 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
         }
     }
     if text.trim().is_empty() {
-        text = sanitize(&visible_html_text(root));
+        text = sanitize(
+            &visible_html_text(root)
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" "),
+        );
     }
     let link_selector = Selector::parse("a[href]").unwrap();
     let mut links = Vec::new();
@@ -421,7 +434,15 @@ fn render_web(url: &Url, source: &str) -> Result<WebPage> {
     for anchor in root.select(&link_selector) {
         if let Some(href) = anchor.value().attr("href") {
             if let Ok(link) = url.join(href) {
-                let label = sanitize(&visible_html_text(anchor));
+                let label = sanitize(
+                    &visible_html_text(anchor)
+                        .split_whitespace()
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                );
+                if label.trim() == "¶" {
+                    continue;
+                }
                 if validate_local_url(&link).is_ok() {
                     links.push(link.clone());
                     visible_links.push(format!("  [{}] {} <{}>", links.len(), label, link));
@@ -546,7 +567,7 @@ fn web_ui(start: Url, max_bytes: usize) -> Result<()> {
     let mut offset = 0usize;
     let mut link_number = String::new();
     loop {
-        let (_, rows) = terminal::size()?;
+        let (columns, rows) = terminal::size()?;
         let page = &history[position];
         execute!(
             io::stdout(),
@@ -554,10 +575,20 @@ fn web_ui(start: Url, max_bytes: usize) -> Result<()> {
             terminal::Clear(ClearType::All)
         )?;
         println!("sl local web: {}  (q help: ?) {}", page.url, link_number);
-        let lines: Vec<_> = page.text.lines().collect();
+        let lines = page
+            .text
+            .lines()
+            .flat_map(|line| {
+                if line.is_empty() {
+                    vec![String::new()]
+                } else {
+                    wrap_display(line, columns as usize)
+                }
+            })
+            .collect::<Vec<_>>();
         let height = rows.saturating_sub(2) as usize;
         for line in lines.iter().skip(offset).take(height) {
-            println!("{}", truncate_display(line, terminal::size()?.0 as usize));
+            println!("{line}");
         }
         io::stdout().flush()?;
         if let Event::Key(key) = event::read()? {

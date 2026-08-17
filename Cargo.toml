@@ -28,5 +28,9 @@ serde_yaml_ng = "0.10.0"
 toml = "1.1.4"
 unicode-width = "0.2.2"
 
+[patch.crates-io]
+# minus 5.7.2 panics after confirming a search with no matches.
+minus = { path = "vendor/minus" }
+
 [dev-dependencies]
 insta = { version = "1.48.0", features = ["yaml"] }

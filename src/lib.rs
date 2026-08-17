@@ -260,6 +260,9 @@ pub fn run(cli: Cli) -> i32 {
 fn page(output: &str) -> Result<()> {
     let pager = minus::Pager::new();
     pager
+        .set_run_no_overflow(true)
+        .context("could not configure pager")?;
+    pager
         .push_str(output)
         .context("could not prepare pager output")?;
     minus::page_all(pager).context("could not start pager")?;

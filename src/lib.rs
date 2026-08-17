@@ -1,7 +1,7 @@
 use std::{
     fs,
     io::{self, IsTerminal, Read, Write},
-    net::TcpStream,
+    net::{TcpStream, ToSocketAddrs},
     path::Path,
     time::Duration,
 };
@@ -319,7 +319,12 @@ fn fetch_web(start: &Url, max_bytes: usize) -> Result<WebPage> {
         } else {
             format!("{host}:{}", url.port_or_known_default().unwrap_or(80))
         };
-        let mut stream = TcpStream::connect(&address)
+        let socket = address
+            .to_socket_addrs()
+            .with_context(|| "could not resolve local web server")?
+            .find(|candidate| candidate.ip().is_loopback())
+            .context("localhost did not resolve to a loopback address")?;
+        let mut stream = TcpStream::connect_timeout(&socket, Duration::from_secs(3))
             .with_context(|| "could not connect to local web server")?;
         stream.set_read_timeout(Some(Duration::from_secs(10)))?;
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
